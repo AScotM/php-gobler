@@ -78,72 +78,35 @@ class MarkovSeedGenerator
             try {
                 return random_int(0, $n - 1);
             } catch (Throwable $e) {
+                // Fall through to fallback
             }
         }
-        $fallback = mt_rand(0, PHP_INT_MAX);
-        return abs($fallback) % $n;
+        // Better fallback without bias
+        $bytes = random_bytes(8);
+        $value = unpack('J', $bytes)[1];
+        return abs($value) % $n;
     }
 
     private function sanitizeText(string $text): string
     {
-        $result = '';
-        $length = mb_strlen($text);
-        for ($i = 0; $i < $length; $i++) {
-            $char = mb_substr($text, $i, 1);
-            $code = $this->unicodeOrd($char);
-            if ($code === null) {
-                continue;
-            }
-            if ($char === "\t" || $char === "\n" || $char === "\r") {
-                $result .= $char;
-                continue;
-            }
-            if ($this->isControl($code)) {
-                continue;
-            }
-            $result .= $char;
-        }
-        return $result;
-    }
-
-    private function isControl(int $codePoint): bool
-    {
-        return ($codePoint < 32 && $codePoint !== 9 && $codePoint !== 10 && $codePoint !== 13) 
-            || ($codePoint >= 0x7F && $codePoint <= 0x9F)
-            || ($codePoint >= 0x2028 && $codePoint <= 0x2029);
-    }
-
-    private function unicodeOrd(string $char): ?int
-    {
-        $code = mb_ord($char, 'UTF-8');
-        return $code === false ? null : $code;
-    }
-
-    private function splitString(string $text): array
-    {
-        $result = [];
-        $length = mb_strlen($text);
-        for ($i = 0; $i < $length; $i++) {
-            $result[] = mb_substr($text, $i, 1);
-        }
-        return $result;
+        return preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/u', '', $text);
     }
 
     public function train(string $inputText): void
     {
         $text = $this->sanitizeText($inputText);
-        $runes = $this->splitString($text);
+        $textLength = mb_strlen($text);
         
-        if (count($runes) <= $this->n) {
-            throw new InvalidArgumentException(sprintf('text length %d must be greater than n %d', count($runes), $this->n));
+        if ($textLength <= $this->n) {
+            throw new InvalidArgumentException(sprintf('text length %d must be greater than n %d', $textLength, $this->n));
         }
         
         $this->text = $text;
-        $limit = count($runes) - $this->n;
+        $this->model = [];
         
-        for ($i = 0; $i < $limit; $i++) {
-            $key = implode('', array_slice($runes, $i, $this->n));
-            $nextChar = $runes[$i + $this->n];
+        for ($i = 0; $i <= $textLength - $this->n - 1; $i++) {
+            $key = mb_substr($text, $i, $this->n);
+            $nextChar = mb_substr($text, $i + $this->n, 1);
             
             if (!isset($this->model[$key])) {
                 $this->model[$key] = [];
@@ -198,9 +161,9 @@ class MarkovSeedGenerator
         $seed = '';
         
         if ($startWith !== null) {
-            $startRunes = $this->splitString($startWith);
-            if (count($startRunes) >= $this->n) {
-                $seed = implode('', array_slice($startRunes, 0, $this->n));
+            $startLength = mb_strlen($startWith);
+            if ($startLength >= $this->n) {
+                $seed = mb_substr($startWith, 0, $this->n);
             }
         }
         
@@ -213,24 +176,25 @@ class MarkovSeedGenerator
             $this->log('Starting generation with: %s', $seed);
         }
         
-        $output = $this->splitString($seed);
+        $output = $seed;
         
-        while (count($output) < $length) {
-            $currentSeed = implode('', array_slice($output, -$this->n, $this->n));
+        while (mb_strlen($output) < $length) {
+            $currentSeed = mb_substr($output, -$this->n);
             $nextChars = $this->model[$currentSeed] ?? [];
             
             if (count($nextChars) === 0) {
                 $similar = $this->findSimilarNgram($currentSeed);
-                if ($similar !== '') {
+                if ($similar !== '' && isset($this->model[$similar])) {
                     $this->log('Fallback: using similar n-gram %s for %s', $similar, $currentSeed);
-                    $nextChars = $this->model[$similar] ?? [];
+                    $nextChars = $this->model[$similar];
                 } else {
                     if (empty($this->text)) {
                         throw new RuntimeException('no text available for fallback');
                     }
-                    $runes = $this->splitString($this->text);
-                    $nextChar = $runes[$this->secureRandInt(count($runes))];
-                    $output[] = $nextChar;
+                    $textLength = mb_strlen($this->text);
+                    $randomPos = $this->secureRandInt($textLength);
+                    $nextChar = mb_substr($this->text, $randomPos, 1);
+                    $output .= $nextChar;
                     continue;
                 }
             }
@@ -240,32 +204,35 @@ class MarkovSeedGenerator
             }
             
             $nextChar = $nextChars[$this->secureRandInt(count($nextChars))];
-            $output[] = $nextChar;
+            $output .= $nextChar;
         }
         
-        return implode('', array_slice($output, 0, $length));
+        return mb_substr($output, 0, $length);
     }
 
     public function findSimilarNgram(string $target): string
     {
         $bestMatch = '';
-        $bestDistance = -1;
-        $targetRunes = $this->splitString($target);
+        $bestDistance = PHP_INT_MAX;
+        $targetLength = mb_strlen($target);
         
         foreach ($this->model as $key => $transitions) {
             if (count($transitions) === 0) {
                 continue;
             }
             
-            $keyRunes = $this->splitString($key);
-            $distance = $this->levenshteinDistance($targetRunes, $keyRunes);
+            $keyLength = mb_strlen($key);
+            if ($keyLength !== $targetLength) {
+                continue;
+            }
             
-            if ($bestDistance === -1 || $distance < $bestDistance) {
+            $distance = $this->simpleStringDistance($target, $key);
+            if ($distance < $bestDistance) {
                 $bestDistance = $distance;
                 $bestMatch = $key;
             }
             
-            if ($bestDistance <= 1) {
+            if ($bestDistance === 0) {
                 break;
             }
         }
@@ -273,34 +240,16 @@ class MarkovSeedGenerator
         return $bestMatch;
     }
 
-    private function levenshteinDistance(array $a, array $b): int
+    private function simpleStringDistance(string $a, string $b): int
     {
-        $la = count($a);
-        $lb = count($b);
-        
-        if ($la === 0) return $lb;
-        if ($lb === 0) return $la;
-        
-        $matrix = [];
-        for ($i = 0; $i <= $la; $i++) {
-            $matrix[$i] = [$i];
-        }
-        for ($j = 0; $j <= $lb; $j++) {
-            $matrix[0][$j] = $j;
-        }
-        
-        for ($i = 1; $i <= $la; $i++) {
-            for ($j = 1; $j <= $lb; $j++) {
-                $cost = ($a[$i - 1] === $b[$j - 1]) ? 0 : 1;
-                $matrix[$i][$j] = min(
-                    $matrix[$i - 1][$j] + 1,
-                    $matrix[$i][$j - 1] + 1,
-                    $matrix[$i - 1][$j - 1] + $cost
-                );
+        $distance = 0;
+        $length = mb_strlen($a);
+        for ($i = 0; $i < $length; $i++) {
+            if (mb_substr($a, $i, 1) !== mb_substr($b, $i, 1)) {
+                $distance++;
             }
         }
-        
-        return $matrix[$la][$lb];
+        return $distance;
     }
 
     public function validateModel(): void
@@ -310,12 +259,12 @@ class MarkovSeedGenerator
         }
         
         foreach ($this->model as $key => $transitions) {
-            if (!is_string($key)) {
-                throw new RuntimeException(sprintf('invalid key type: %s', gettype($key)));
-            }
             $len = mb_strlen($key);
             if ($len !== $this->n) {
                 throw new RuntimeException(sprintf('invalid key length: %s (expected %d)', $key, $this->n));
+            }
+            if (!is_array($transitions)) {
+                throw new RuntimeException(sprintf('invalid transitions type for key %s', $key));
             }
         }
     }
@@ -387,7 +336,15 @@ class MarkovSeedGenerator
             throw new RuntimeException('failed to decode model');
         }
         
-        $this->n = (int) $data['n'];
+        $loadedN = (int) $data['n'];
+        if ($loadedN !== $this->n) {
+            throw new RuntimeException(sprintf(
+                'loaded model n=%d does not match current n=%d', 
+                $loadedN, 
+                $this->n
+            ));
+        }
+        
         $this->model = $data['model'];
         $this->log('Model loaded from %s with %d n-grams', $filename, count($this->model));
     }
