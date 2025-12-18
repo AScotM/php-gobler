@@ -12,6 +12,8 @@ class ModelStats
     public int $maxTransitions = 0;
     public int $minTransitions = -1;
     public int $deadEnds = 0;
+    public int $uniqueTransitions = 0;
+    public float $entropy = 0.0;
 
     public function toArray(): array
     {
@@ -22,6 +24,8 @@ class ModelStats
             'maxTransitions' => $this->maxTransitions,
             'minTransitions' => $this->minTransitions,
             'deadEnds' => $this->deadEnds,
+            'uniqueTransitions' => $this->uniqueTransitions,
+            'entropy' => $this->entropy,
         ];
     }
 }
@@ -34,18 +38,24 @@ class MarkovSeedGenerator
     public bool $verbose;
     public array $logMessages;
     public bool $useSecureRand;
+    private int $maxModelSize;
 
-    public function __construct(int $n = 3, bool $verbose = false, bool $useSecureRand = true)
+    public function __construct(int $n = 3, bool $verbose = false, bool $useSecureRand = true, int $maxModelSize = 100000)
     {
         if ($n <= 0) {
             throw new InvalidArgumentException('n must be positive');
         }
+        if ($maxModelSize <= 0) {
+            throw new InvalidArgumentException('maxModelSize must be positive');
+        }
+        
         $this->n = $n;
         $this->model = [];
         $this->text = '';
         $this->verbose = $verbose;
         $this->logMessages = [];
         $this->useSecureRand = $useSecureRand;
+        $this->maxModelSize = $maxModelSize;
     }
 
     public function log(string $format, mixed ...$args): void
@@ -74,6 +84,7 @@ class MarkovSeedGenerator
         if ($n <= 0) {
             return 0;
         }
+        
         if ($this->useSecureRand) {
             try {
                 return random_int(0, $n - 1);
@@ -81,20 +92,38 @@ class MarkovSeedGenerator
                 // Fall through to fallback
             }
         }
-        // Better fallback without bias
-        $bytes = random_bytes(8);
-        $value = unpack('J', $bytes)[1];
-        return abs($value) % $n;
+        
+        // Bias-free rejection sampling fallback
+        $bits = ceil(log($n, 2)) + 8;
+        $bytes = (int)ceil($bits / 8);
+        
+        do {
+            $randomBytes = random_bytes($bytes);
+            $value = 0;
+            for ($i = 0; $i < $bytes; $i++) {
+                $value = ($value << 8) | ord($randomBytes[$i]);
+            }
+            $value &= (1 << $bits) - 1;
+        } while ($value >= $n);
+        
+        return $value;
     }
 
     private function sanitizeText(string $text): string
     {
-        return preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/u', '', $text);
+        $text = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/u', '', $text);
+        return trim($text);
+    }
+
+    private function normalizeWhitespace(string $text): string
+    {
+        return preg_replace('/\s+/u', ' ', $text);
     }
 
     public function train(string $inputText): void
     {
         $text = $this->sanitizeText($inputText);
+        $text = $this->normalizeWhitespace($text);
         $textLength = mb_strlen($text);
         
         if ($textLength <= $this->n) {
@@ -104,28 +133,51 @@ class MarkovSeedGenerator
         $this->text = $text;
         $this->model = [];
         
+        $startTime = microtime(true);
+        
         for ($i = 0; $i <= $textLength - $this->n - 1; $i++) {
             $key = mb_substr($text, $i, $this->n);
             $nextChar = mb_substr($text, $i + $this->n, 1);
             
             if (!isset($this->model[$key])) {
-                $this->model[$key] = [];
+                if (count($this->model) >= $this->maxModelSize) {
+                    $this->log('Warning: Model size limit reached (%d entries)', $this->maxModelSize);
+                    break;
+                }
+                $this->model[$key] = ['count' => 0, 'chars' => []];
             }
-            $this->model[$key][] = $nextChar;
+            
+            // Ensure character is stored as string
+            $nextCharStr = (string)$nextChar;
+            if (!isset($this->model[$key]['chars'][$nextCharStr])) {
+                $this->model[$key]['chars'][$nextCharStr] = 0;
+            }
+            $this->model[$key]['chars'][$nextCharStr]++;
+            $this->model[$key]['count']++;
         }
         
-        $this->log('Trained model with %d n-grams', count($this->model));
+        $trainingTime = microtime(true) - $startTime;
+        $this->log('Trained model with %d n-grams in %.3f seconds', count($this->model), $trainingTime);
     }
 
     public function trainFromFile(string $filename): void
     {
-        if (!is_readable($filename)) {
-            throw new RuntimeException(sprintf('failed to open training file: %s', $filename));
+        if (!is_string($filename) || $filename === '') {
+            throw new InvalidArgumentException('filename must be a non-empty string');
         }
         
-        $size = filesize($filename);
+        $realpath = realpath($filename);
+        if ($realpath === false) {
+            throw new RuntimeException(sprintf('file does not exist or cannot be resolved: %s', $filename));
+        }
+        
+        if (!is_readable($realpath)) {
+            throw new RuntimeException(sprintf('file not readable: %s', $realpath));
+        }
+        
+        $size = filesize($realpath);
         if ($size === false) {
-            throw new RuntimeException(sprintf('failed to get file size: %s', $filename));
+            throw new RuntimeException(sprintf('failed to get file size: %s', $realpath));
         }
         
         if ($size === 0) {
@@ -134,17 +186,41 @@ class MarkovSeedGenerator
         
         $maxSize = 100 * 1024 * 1024;
         if ($size > $maxSize) {
-            throw new RuntimeException(sprintf('file too large: %d bytes', $size));
+            throw new RuntimeException(sprintf('file too large: %d bytes (max: %d)', $size, $maxSize));
         }
         
-        $this->log('Training from file: %s', $filename);
+        $this->log('Training from file: %s (%d bytes)', $realpath, $size);
         
-        $content = file_get_contents($filename);
+        $content = file_get_contents($realpath);
         if ($content === false) {
-            throw new RuntimeException(sprintf('failed to read training file: %s', $filename));
+            throw new RuntimeException(sprintf('failed to read training file: %s', $realpath));
         }
         
         $this->train($content);
+    }
+
+    private function weightedRandomChoice(array $charCounts): string
+    {
+        $total = 0;
+        foreach ($charCounts as $count) {
+            $total += $count;
+        }
+        
+        if ($total <= 0) {
+            return '';
+        }
+        
+        $rand = $this->secureRandInt($total);
+        $cumulative = 0;
+        
+        foreach ($charCounts as $char => $count) {
+            $cumulative += $count;
+            if ($rand < $cumulative) {
+                return (string)$char;
+            }
+        }
+        
+        return '';
     }
 
     public function generate(int $length, ?string $startWith = null): string
@@ -160,7 +236,7 @@ class MarkovSeedGenerator
         $keys = array_keys($this->model);
         $seed = '';
         
-        if ($startWith !== null) {
+        if ($startWith !== null && $startWith !== '') {
             $startLength = mb_strlen($startWith);
             if ($startLength >= $this->n) {
                 $seed = mb_substr($startWith, 0, $this->n);
@@ -169,24 +245,23 @@ class MarkovSeedGenerator
         
         if ($seed === '' || !isset($this->model[$seed])) {
             $seed = $keys[$this->secureRandInt(count($keys))];
-            if ($startWith !== null) {
-                $this->log('Warning: Starting text %s not found, using random n-gram', $startWith);
+            if ($startWith !== null && $startWith !== '') {
+                $this->log('Starting text "%s" not found in model, using random n-gram: "%s"', $startWith, $seed);
             }
         } else {
-            $this->log('Starting generation with: %s', $seed);
+            $this->log('Starting generation with: "%s"', $seed);
         }
         
         $output = $seed;
         
         while (mb_strlen($output) < $length) {
             $currentSeed = mb_substr($output, -$this->n);
-            $nextChars = $this->model[$currentSeed] ?? [];
             
-            if (count($nextChars) === 0) {
+            if (!isset($this->model[$currentSeed])) {
                 $similar = $this->findSimilarNgram($currentSeed);
                 if ($similar !== '' && isset($this->model[$similar])) {
-                    $this->log('Fallback: using similar n-gram %s for %s', $similar, $currentSeed);
-                    $nextChars = $this->model[$similar];
+                    $this->log('Fallback: using similar n-gram "%s" for "%s"', $similar, $currentSeed);
+                    $currentSeed = $similar;
                 } else {
                     if (empty($this->text)) {
                         throw new RuntimeException('no text available for fallback');
@@ -199,11 +274,16 @@ class MarkovSeedGenerator
                 }
             }
             
-            if (count($nextChars) === 0) {
-                throw new RuntimeException('no valid transitions available');
+            $charCounts = $this->model[$currentSeed]['chars'] ?? [];
+            if (empty($charCounts)) {
+                throw new RuntimeException(sprintf('no valid transitions available for n-gram "%s"', $currentSeed));
             }
             
-            $nextChar = $nextChars[$this->secureRandInt(count($nextChars))];
+            $nextChar = $this->weightedRandomChoice($charCounts);
+            if ($nextChar === '') {
+                throw new RuntimeException('failed to select next character');
+            }
+            
             $output .= $nextChar;
         }
         
@@ -216,8 +296,12 @@ class MarkovSeedGenerator
         $bestDistance = PHP_INT_MAX;
         $targetLength = mb_strlen($target);
         
-        foreach ($this->model as $key => $transitions) {
-            if (count($transitions) === 0) {
+        if ($targetLength !== $this->n) {
+            return $bestMatch;
+        }
+        
+        foreach ($this->model as $key => $data) {
+            if (empty($data['chars'])) {
                 continue;
             }
             
@@ -242,9 +326,15 @@ class MarkovSeedGenerator
 
     private function simpleStringDistance(string $a, string $b): int
     {
+        $lengthA = mb_strlen($a);
+        $lengthB = mb_strlen($b);
+        
+        if ($lengthA !== $lengthB) {
+            return PHP_INT_MAX;
+        }
+        
         $distance = 0;
-        $length = mb_strlen($a);
-        for ($i = 0; $i < $length; $i++) {
+        for ($i = 0; $i < $lengthA; $i++) {
             if (mb_substr($a, $i, 1) !== mb_substr($b, $i, 1)) {
                 $distance++;
             }
@@ -258,13 +348,16 @@ class MarkovSeedGenerator
             throw new RuntimeException(sprintf('invalid n value: %d', $this->n));
         }
         
-        foreach ($this->model as $key => $transitions) {
+        foreach ($this->model as $key => $data) {
             $len = mb_strlen($key);
             if ($len !== $this->n) {
                 throw new RuntimeException(sprintf('invalid key length: %s (expected %d)', $key, $this->n));
             }
-            if (!is_array($transitions)) {
-                throw new RuntimeException(sprintf('invalid transitions type for key %s', $key));
+            if (!is_array($data) || !isset($data['count']) || !isset($data['chars'])) {
+                throw new RuntimeException(sprintf('invalid data structure for key %s', $key));
+            }
+            if ($data['count'] <= 0) {
+                throw new RuntimeException(sprintf('non-positive transition count for key %s', $key));
             }
         }
     }
@@ -273,10 +366,13 @@ class MarkovSeedGenerator
     {
         $stats = new ModelStats();
         
-        foreach ($this->model as $transitions) {
-            $count = count($transitions);
+        foreach ($this->model as $data) {
+            $count = $data['count'];
+            $unique = count($data['chars']);
+            
             $stats->nGrams++;
             $stats->totalTransitions += $count;
+            $stats->uniqueTransitions += $unique;
             
             if ($count > $stats->maxTransitions) {
                 $stats->maxTransitions = $count;
@@ -284,13 +380,23 @@ class MarkovSeedGenerator
             if ($stats->minTransitions === -1 || $count < $stats->minTransitions) {
                 $stats->minTransitions = $count;
             }
-            if ($count === 0) {
+            if ($unique === 0) {
                 $stats->deadEnds++;
+            }
+            
+            if ($unique > 0) {
+                $entropy = 0.0;
+                foreach ($data['chars'] as $charCount) {
+                    $probability = $charCount / $count;
+                    $entropy -= $probability * log($probability, 2);
+                }
+                $stats->entropy += $entropy;
             }
         }
         
         if ($stats->nGrams > 0) {
             $stats->avgTransitions = (float)($stats->totalTransitions / $stats->nGrams);
+            $stats->entropy /= $stats->nGrams;
         }
         
         return $stats;
@@ -298,42 +404,83 @@ class MarkovSeedGenerator
 
     public function saveModel(string $filename): void
     {
+        if (!is_string($filename) || $filename === '') {
+            throw new InvalidArgumentException('filename must be a non-empty string');
+        }
+        
+        $dir = dirname($filename);
+        if ($dir !== '' && !is_dir($dir)) {
+            throw new RuntimeException(sprintf('directory does not exist: %s', $dir));
+        }
+        
         $payload = [
             'n' => $this->n,
             'model' => $this->model,
             'meta' => [
                 'timestamp' => (new DateTimeImmutable())->format(DateTime::ATOM),
                 'size' => count($this->model),
+                'version' => '1.1',
             ],
         ];
         
-        $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
-        if ($json === false) {
-            throw new RuntimeException('failed to encode model to JSON');
+        $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+        
+        $tempFile = tempnam($dir ?: sys_get_temp_dir(), 'markov_');
+        if ($tempFile === false) {
+            throw new RuntimeException('failed to create temporary file');
         }
         
-        $result = file_put_contents($filename, $json);
-        if ($result === false) {
-            throw new RuntimeException(sprintf('failed to write model file: %s', $filename));
+        try {
+            if (file_put_contents($tempFile, $json) === false) {
+                throw new RuntimeException('failed to write temporary file');
+            }
+            
+            if (!rename($tempFile, $filename)) {
+                throw new RuntimeException(sprintf('failed to move file to destination: %s', $filename));
+            }
+            
+            $this->log('Model saved to %s', $filename);
+        } catch (Throwable $e) {
+            if (file_exists($tempFile)) {
+                unlink($tempFile);
+            }
+            throw $e;
         }
-        
-        $this->log('Model saved to %s', $filename);
     }
 
     public function loadModel(string $filename): void
     {
-        if (!is_readable($filename)) {
-            throw new RuntimeException(sprintf('failed to open model file: %s', $filename));
+        if (!is_string($filename) || $filename === '') {
+            throw new InvalidArgumentException('filename must be a non-empty string');
         }
         
-        $json = file_get_contents($filename);
+        $realpath = realpath($filename);
+        if ($realpath === false) {
+            throw new RuntimeException(sprintf('file does not exist: %s', $filename));
+        }
+        
+        if (!is_readable($realpath)) {
+            throw new RuntimeException(sprintf('file not readable: %s', $realpath));
+        }
+        
+        $size = filesize($realpath);
+        if ($size === false || $size === 0) {
+            throw new RuntimeException('file is empty or invalid');
+        }
+        
+        $json = file_get_contents($realpath);
         if ($json === false) {
-            throw new RuntimeException(sprintf('failed to read model file: %s', $filename));
+            throw new RuntimeException(sprintf('failed to read model file: %s', $realpath));
         }
         
-        $data = json_decode($json, true);
+        try {
+            $data = json_decode($json, true, 512, JSON_THROW_ON_ERROR);
+        } catch (JsonException $e) {
+            throw new RuntimeException('failed to decode JSON: ' . $e->getMessage());
+        }
+        
         if (!is_array($data) || !isset($data['n']) || !isset($data['model'])) {
-            throw new RuntimeException('failed to decode model');
+            throw new RuntimeException('invalid model structure');
         }
         
         $loadedN = (int) $data['n'];
@@ -346,7 +493,7 @@ class MarkovSeedGenerator
         }
         
         $this->model = $data['model'];
-        $this->log('Model loaded from %s with %d n-grams', $filename, count($this->model));
+        $this->log('Model loaded from %s with %d n-grams', $realpath, count($this->model));
     }
 
     public function getAvailableKeys(): array
@@ -356,7 +503,10 @@ class MarkovSeedGenerator
 
     public function getTransitions(string $key): array
     {
-        return $this->model[$key] ?? [];
+        if (!isset($this->model[$key])) {
+            return [];
+        }
+        return $this->model[$key]['chars'];
     }
 
     public function reset(): void
@@ -370,13 +520,15 @@ class MarkovSeedGenerator
     {
         $stats = $this->getModelStats();
         return sprintf(
-            "Model Statistics:\n- N-Grams: %d\n- Total Transitions: %d\n- Average Transitions: %.2f\n- Max Transitions: %d\n- Min Transitions: %d\n- Dead Ends: %d\n",
+            "Model Statistics:\n- N-Grams: %d\n- Total Transitions: %d\n- Unique Transitions: %d\n- Average Transitions: %.2f\n- Max Transitions: %d\n- Min Transitions: %d\n- Dead Ends: %d\n- Average Entropy: %.3f\n",
             $stats->nGrams,
             $stats->totalTransitions,
+            $stats->uniqueTransitions,
             $stats->avgTransitions,
             $stats->maxTransitions,
             $stats->minTransitions,
-            $stats->deadEnds
+            $stats->deadEnds,
+            $stats->entropy
         );
     }
 }
