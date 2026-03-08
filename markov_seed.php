@@ -256,6 +256,7 @@ class MarkovSeedGenerator
         }
         
         $keys = array_keys($this->model);
+        $keys = array_map('strval', $keys);
         $seed = '';
         
         if ($startWith !== null && $startWith !== '') {
@@ -326,19 +327,21 @@ class MarkovSeedGenerator
         }
         
         foreach ($this->model as $key => $data) {
+            $keyStr = (string)$key;
+            
             if (!is_array($data) || empty($data['chars'])) {
                 continue;
             }
             
-            $keyLength = mb_strlen($key);
+            $keyLength = mb_strlen($keyStr);
             if ($keyLength !== $targetLength) {
                 continue;
             }
             
-            $distance = $this->simpleStringDistance($target, $key);
+            $distance = $this->simpleStringDistance($target, $keyStr);
             if ($distance < $bestDistance) {
                 $bestDistance = $distance;
-                $bestMatch = $key;
+                $bestMatch = $keyStr;
             }
             
             if ($bestDistance === 0) {
@@ -377,19 +380,20 @@ class MarkovSeedGenerator
         }
         
         foreach ($this->model as $key => $data) {
-            $len = mb_strlen($key);
+            $keyStr = (string)$key;
+            $len = mb_strlen($keyStr);
             if ($len !== $this->n) {
-                throw new RuntimeException(sprintf('invalid key length: %s (expected %d)', $key, $this->n));
+                throw new RuntimeException(sprintf('invalid key length: %s (expected %d)', $keyStr, $this->n));
             }
             if (!is_array($data) || !isset($data['count']) || !isset($data['chars']) || !is_array($data['chars'])) {
-                throw new RuntimeException(sprintf('invalid data structure for key %s', $key));
+                throw new RuntimeException(sprintf('invalid data structure for key %s', $keyStr));
             }
             if ($data['count'] <= 0) {
-                throw new RuntimeException(sprintf('non-positive transition count for key %s', $key));
+                throw new RuntimeException(sprintf('non-positive transition count for key %s', $keyStr));
             }
             foreach ($data['chars'] as $char => $count) {
                 if (!is_int($count) || $count <= 0) {
-                    throw new RuntimeException(sprintf('invalid character count for key %s, char %s', $key, $char));
+                    throw new RuntimeException(sprintf('invalid character count for key %s, char %s', $keyStr, (string)$char));
                 }
             }
         }
@@ -494,10 +498,11 @@ class MarkovSeedGenerator
         
         $data = [
             'n' => $this->n,
-            'model' => serialize($this->model)
+            'model' => $this->model
         ];
         
-        $compressed = gzcompress(serialize($data));
+        $serialized = serialize($data);
+        $compressed = gzcompress($serialized);
         if ($compressed === false) {
             throw new RuntimeException('failed to compress model data');
         }
@@ -550,27 +555,57 @@ class MarkovSeedGenerator
             throw new RuntimeException(sprintf('failed to read model file: %s', $realpath));
         }
         
+        if (substr($filename, -5) === '.json') {
+            $this->loadJsonModel($content);
+        } else {
+            $this->loadBinaryModel($content);
+        }
+    }
+    
+    private function loadJsonModel(string $content): void
+    {
         try {
             $data = json_decode($content, true, 512, JSON_THROW_ON_ERROR);
-        } catch (JsonException $e) {
-            try {
-                $uncompressed = gzuncompress($content);
-                if ($uncompressed === false) {
-                    throw new RuntimeException('failed to decompress data');
-                }
-                $data = unserialize($uncompressed);
-                if (!is_array($data)) {
-                    throw new RuntimeException('invalid binary model structure');
-                }
-            } catch (Throwable $e2) {
-                throw new RuntimeException('failed to decode model: ' . $e->getMessage());
+            
+            if (!is_array($data) || !isset($data['n']) || !isset($data['model'])) {
+                throw new RuntimeException('invalid JSON model structure');
             }
+            
+            $this->validateAndSetModel($data);
+            $this->log('JSON model loaded with %d n-grams', count($this->model));
+            
+        } catch (JsonException $e) {
+            throw new RuntimeException('failed to decode JSON model: ' . $e->getMessage());
         }
-        
-        if (!is_array($data) || !isset($data['n']) || !isset($data['model'])) {
-            throw new RuntimeException('invalid model structure');
+    }
+    
+    private function loadBinaryModel(string $content): void
+    {
+        try {
+            $uncompressed = gzuncompress($content);
+            if ($uncompressed === false) {
+                throw new RuntimeException('failed to decompress binary model');
+            }
+            
+            $data = unserialize($uncompressed);
+            if (!is_array($data)) {
+                throw new RuntimeException('invalid binary model structure');
+            }
+            
+            if (!isset($data['n']) || !isset($data['model'])) {
+                throw new RuntimeException('binary model missing required fields');
+            }
+            
+            $this->validateAndSetModel($data);
+            $this->log('Binary model loaded with %d n-grams', count($this->model));
+            
+        } catch (Throwable $e) {
+            throw new RuntimeException('failed to load binary model: ' . $e->getMessage());
         }
-        
+    }
+    
+    private function validateAndSetModel(array $data): void
+    {
         $loadedN = (int) $data['n'];
         if ($loadedN !== $this->n) {
             throw new RuntimeException(sprintf(
@@ -585,13 +620,13 @@ class MarkovSeedGenerator
         }
         
         foreach ($data['model'] as $key => $value) {
-            if (!is_string($key) || !is_array($value) || !isset($value['count']) || !isset($value['chars']) || !is_array($value['chars'])) {
-                throw new RuntimeException(sprintf('invalid entry in loaded model for key: %s', $key));
+            $keyStr = (string)$key;
+            if (!is_array($value) || !isset($value['count']) || !isset($value['chars']) || !is_array($value['chars'])) {
+                throw new RuntimeException(sprintf('invalid entry in loaded model for key: %s', $keyStr));
             }
         }
         
         $this->model = $data['model'];
-        $this->log('Model loaded from %s with %d n-grams', $realpath, count($this->model));
     }
 
     public function getAvailableKeys(): array
